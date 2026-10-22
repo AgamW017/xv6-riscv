@@ -69,6 +69,9 @@ usertrap(void)
   } else if ((which_dev = devintr()) != 0) {
     // ok
   } else if ((r_scause() == 15 || r_scause() == 13) &&
+             mmapfault(p, r_stval(), r_scause() == 15)) {
+    // page fault on a memory-mapped file
+  } else if ((r_scause() == 15 || r_scause() == 13) &&
              vmfault(p->pagetable, p->sz, r_stval(),
                      (r_scause() == 13) ? 1 : 0) != 0) {
     // page fault on lazily-allocated page
@@ -82,8 +85,18 @@ usertrap(void)
     kexit(-1);
 
   // give up the CPU if this is a timer interrupt.
-  if (which_dev == 2)
+  if (which_dev == 2) {
+    if (p->alarm_interval > 0 && !p->alarm_active) {
+      p->alarm_ticks++;
+      if (p->alarm_ticks >= p->alarm_interval) {
+        p->alarm_ticks = 0;
+        p->alarm_active = 1;
+        p->alarm_trapframe = *p->trapframe;
+        p->trapframe->epc = p->alarm_handler;
+      }
+    }
     yield();
+  }
 
   prepare_return();
 

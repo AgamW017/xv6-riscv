@@ -101,4 +101,19 @@ struct proc {
   struct file *ofile[NOFILE];  // Open files
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
+
+  int alarm_interval;
+  int alarm_ticks;
+  uint64 alarm_handler;
+  int alarm_active;
+  struct trapframe alarm_trapframe;
+
+  struct mmap_region {
+    uint64 addr;
+    uint64 len;
+    int prot;
+    int flags;
+    int offset;
+    struct file *file;
+  } mmap_regions[NMMAP];
 };

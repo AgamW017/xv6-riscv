@@ -6,6 +6,7 @@
 
 #include "types.h"
 #include "riscv.h"
+#include "memlayout.h"
 #include "defs.h"
 #include "param.h"
 #include "stat.h"
@@ -33,6 +34,8 @@ argfd(int n, int *pfd, struct file **pf)
     *pf = f;
   return 0;
 }
+
+static struct inode *create(char *, short, short, short);
 
 // Allocate a file descriptor for the given file.
 // Takes over file reference from caller on success.
@@ -167,6 +170,30 @@ bad:
   iunlockput(ip);
   end_op();
   return -1;
+}
+
+uint64
+sys_symlink(void)
+{
+  char target[MAXPATH], path[MAXPATH];
+  struct inode *ip;
+
+  if (argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+    return -1;
+  begin_op();
+  if ((ip = create(path, T_SYMLINK, 0, 0)) == 0) {
+    end_op();
+    return -1;
+  }
+  int len = strlen(target) + 1;
+  if (writei(ip, 0, (uint64)target, 0, len) != len) {
+    iunlockput(ip);
+    end_op();
+    return -1;
+  }
+  iunlockput(ip);
+  end_op();
+  return 0;
 }
 
 // Is the directory dp empty except for "." and ".." ?
@@ -333,6 +360,29 @@ sys_open(void)
       return -1;
     }
     ilock(ip);
+    for (int depth = 0; ip->type == T_SYMLINK &&
+                         !(omode & O_NOFOLLOW) && depth < 10; depth++) {
+      char target[MAXPATH];
+      int nread = readi(ip, 0, (uint64)target, 0, sizeof(target) - 1);
+      iunlockput(ip);
+      if (nread <= 0) {
+        ip = 0;
+        break;
+      }
+      target[nread] = 0;
+      if ((ip = namei(target)) == 0)
+        break;
+      ilock(ip);
+    }
+    if (ip && ip->type == T_SYMLINK && !(omode & O_NOFOLLOW)) {
+      iunlockput(ip);
+      end_op();
+      return -1;
+    }
+    if (ip == 0) {
+      end_op();
+      return -1;
+    }
     if (ip->type == T_DIR && omode != O_RDONLY) {
       iunlockput(ip);
       end_op();
@@ -373,6 +423,79 @@ sys_open(void)
   end_op();
 
   return fd;
+}
+
+uint64
+sys_mmap(void)
+{
+  uint64 requested, len, offset;
+  int prot, flags, fd;
+  struct file *f;
+  struct proc *p = myproc();
+
+  argaddr(0, &requested);
+  argaddr(1, &len);
+  argint(2, &prot);
+  argint(3, &flags);
+  argint(4, &fd);
+  argaddr(5, &offset);
+  if (requested != 0 || len == 0 || offset != 0 ||
+      (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0 ||
+      (flags != MAP_SHARED && flags != MAP_PRIVATE) ||
+      argfd(4, 0, &f) < 0 || f->type != FD_INODE ||
+      f->ip->type != T_FILE)
+    return (uint64)-1;
+  len = PGROUNDUP(len);
+  if (len >= TRAPFRAME ||
+      ((prot & PROT_READ) && !f->readable) ||
+      ((prot & PROT_WRITE) && !f->writable))
+    return (uint64)-1;
+
+  int slot = -1;
+  for (int i = 0; i < NMMAP; i++)
+    if (p->mmap_regions[i].file == 0) {
+      slot = i;
+      break;
+    }
+  if (slot < 0)
+    return (uint64)-1;
+
+  uint64 addr = TRAPFRAME - len;
+  for (;;) {
+    int overlap = 0;
+    for (int i = 0; i < NMMAP; i++) {
+      if (p->mmap_regions[i].file &&
+          addr < p->mmap_regions[i].addr + p->mmap_regions[i].len &&
+          addr + len > p->mmap_regions[i].addr) {
+        overlap = 1;
+        break;
+      }
+    }
+    if (!overlap && addr >= p->sz)
+      break;
+    if (addr < len + PGSIZE)
+      return (uint64)-1;
+    addr -= len;
+  }
+
+  p->mmap_regions[slot].addr = addr;
+  p->mmap_regions[slot].len = len;
+  p->mmap_regions[slot].prot = prot;
+  p->mmap_regions[slot].flags = flags;
+  p->mmap_regions[slot].offset = 0;
+  p->mmap_regions[slot].file = filedup(f);
+  return addr;
+}
+
+uint64
+sys_munmap(void)
+{
+  uint64 addr, len;
+  argaddr(0, &addr);
+  argaddr(1, &len);
+  if (len == 0 || addr % PGSIZE != 0)
+    return -1;
+  return munmap_region(myproc(), addr, PGROUNDUP(len));
 }
 
 uint64

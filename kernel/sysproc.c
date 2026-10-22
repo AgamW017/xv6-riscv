@@ -80,6 +80,7 @@ sys_pause(void)
       release(&tickslock);
       return -1;
     }
+
     sleep_prepare(&ticks);
     release(&tickslock);
     sleep();
@@ -87,6 +88,37 @@ sys_pause(void)
   }
   release(&tickslock);
   return 0;
+}
+
+uint64
+sys_sigalarm(void)
+{
+  int interval;
+  uint64 handler;
+
+  argint(0, &interval);
+  argaddr(1, &handler);
+  if (interval < 0)
+    return -1;
+  struct proc *p = myproc();
+  p->alarm_interval = interval;
+  p->alarm_handler = handler;
+  p->alarm_ticks = 0;
+  p->alarm_active = 0;
+  return 0;
+}
+
+uint64
+sys_sigreturn(void)
+{
+  struct proc *p = myproc();
+  if (!p->alarm_active)
+    return -1;
+  uint64 saved_a0 = p->alarm_trapframe.a0;
+  *(p->trapframe) = p->alarm_trapframe;
+  p->alarm_active = 0;
+  // syscall() stores this return value in a0; preserve the interrupted value.
+  return saved_a0;
 }
 
 uint64

@@ -167,6 +167,10 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+  p->alarm_interval = 0;
+  p->alarm_ticks = 0;
+  p->alarm_handler = 0;
+  p->alarm_active = 0;
   p->state = UNUSED;
 }
 
@@ -287,6 +291,12 @@ kfork(void)
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
 
+  for (i = 0; i < NMMAP; i++) {
+    np->mmap_regions[i] = p->mmap_regions[i];
+    if (np->mmap_regions[i].file)
+      filedup(np->mmap_regions[i].file);
+  }
+
   safestrcpy(np->name, p->name, sizeof(p->name));
 
   pid = np->pid;
@@ -329,6 +339,15 @@ kexit(int status)
 
   if (p == initproc)
     panic("init exiting");
+
+  for (int i = 0; i < NMMAP; i++) {
+    if (p->mmap_regions[i].file) {
+      uint64 addr = p->mmap_regions[i].addr;
+      uint64 len = p->mmap_regions[i].len;
+      if (munmap_region(p, addr, len) < 0)
+        panic("kexit: munmap");
+    }
+  }
 
   // Close all open files.
   for (int fd = 0; fd < NOFILE; fd++) {

@@ -7,6 +7,9 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "fs.h"
+#include "sleeplock.h"
+#include "file.h"
+#include "fcntl.h"
 
 /*
  * the kernel's page table.
@@ -447,7 +450,7 @@ copyinstr(pagetable_t pagetable, uint64 psz, char *dst, uint64 srcva,
   if (got_null) {
     return 0;
   } else {
-    return -1;
+      return -1;
   }
 }
 
@@ -488,4 +491,104 @@ ismapped(pagetable_t pagetable, uint64 va)
     return 1;
   }
   return 0;
+}
+
+int
+mmapfault(struct proc *p, uint64 faultva, int write)
+{
+    uint64 va = PGROUNDDOWN(faultva);
+    struct mmap_region *m = 0;
+
+    for (int i = 0; i < NMMAP; i++) {
+      if (p->mmap_regions[i].file &&
+          va >= p->mmap_regions[i].addr &&
+          va < p->mmap_regions[i].addr + p->mmap_regions[i].len) {
+        m = &p->mmap_regions[i];
+        break;
+      }
+    }
+    if (m == 0 || (write && !(m->prot & PROT_WRITE)) ||
+        ismapped(p->pagetable, va))
+      return 0;
+
+    char *mem = kalloc();
+    if (mem == 0)
+      return 0;
+    memset(mem, 0, PGSIZE);
+
+    uint64 off = m->offset + (va - m->addr);
+    ilock(m->file->ip);
+    uint n = 0;
+    if (off < m->file->ip->size) {
+      n = m->file->ip->size - off;
+      if (n > PGSIZE)
+        n = PGSIZE;
+      if (readi(m->file->ip, 0, (uint64)mem, off, n) != n) {
+        iunlock(m->file->ip);
+        kfree(mem);
+        return 0;
+      }
+    }
+    iunlock(m->file->ip);
+
+    int perm = PTE_U;
+    if (m->prot & (PROT_READ | PROT_WRITE))
+      perm |= PTE_R;
+    if (m->prot & PROT_WRITE)
+      perm |= PTE_W;
+    if (m->prot & PROT_EXEC)
+      perm |= PTE_X;
+    if (mappages(p->pagetable, va, PGSIZE, (uint64)mem, perm) < 0) {
+      kfree(mem);
+      return 0;
+    }
+    return 1;
+}
+
+static void
+mmap_writeback(struct proc *p, struct mmap_region *m, uint64 va)
+{
+    if (m->flags != MAP_SHARED || !ismapped(p->pagetable, va))
+      return;
+    uint64 off = m->offset + va - m->addr;
+    begin_op();
+    ilock(m->file->ip);
+    if (off < m->file->ip->size) {
+      uint n = m->file->ip->size - off;
+      if (n > PGSIZE)
+        n = PGSIZE;
+      writei(m->file->ip, 0, walkaddr(p->pagetable, va), off, n);
+    }
+    iunlock(m->file->ip);
+    end_op();
+}
+
+int
+munmap_region(struct proc *p, uint64 addr, uint64 len)
+{
+    uint64 end = addr + len;
+    for (int i = 0; i < NMMAP; i++) {
+      struct mmap_region *m = &p->mmap_regions[i];
+      uint64 mend = m->addr + m->len;
+      if (!m->file || addr < m->addr || end > mend)
+        continue;
+
+      for (uint64 va = addr; va < end; va += PGSIZE) {
+        mmap_writeback(p, m, va);
+        if (ismapped(p->pagetable, va))
+          uvmunmap(p->pagetable, va, 1, 1);
+      }
+      if (addr == m->addr && end == mend) {
+        fileclose(m->file);
+        memset(m, 0, sizeof(*m));
+      } else if (addr == m->addr) {
+        m->addr = end;
+        m->len = mend - end;
+        m->offset += len;
+      } else {
+        m->len = addr - m->addr;
+      }
+      return 0;
+    }
+    return -1;
 }
