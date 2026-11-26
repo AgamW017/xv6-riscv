@@ -46,6 +46,8 @@ sys_sbrk(void)
   argint(0, &n);
   argint(1, &t);
   addr = myproc()->sz;
+  if (n > 0 && addr + n > mmap_limit(myproc()))
+    return -1;
 
   if (t == SBRK_EAGER || n < 0) {
     if (growproc(n) < 0) {
@@ -80,7 +82,6 @@ sys_pause(void)
       release(&tickslock);
       return -1;
     }
-
     sleep_prepare(&ticks);
     release(&tickslock);
     sleep();
@@ -104,7 +105,6 @@ sys_sigalarm(void)
   p->alarm_interval = interval;
   p->alarm_handler = handler;
   p->alarm_ticks = 0;
-  p->alarm_active = 0;
   return 0;
 }
 
@@ -114,11 +114,10 @@ sys_sigreturn(void)
   struct proc *p = myproc();
   if (!p->alarm_active)
     return -1;
-  uint64 saved_a0 = p->alarm_trapframe.a0;
-  *(p->trapframe) = p->alarm_trapframe;
+  *p->trapframe = p->alarm_trapframe;
   p->alarm_active = 0;
   // syscall() stores this return value in a0; preserve the interrupted value.
-  return saved_a0;
+  return p->trapframe->a0;
 }
 
 uint64

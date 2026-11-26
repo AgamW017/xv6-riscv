@@ -1,9 +1,4 @@
 #define SBRK_ERROR ((char *)-1)
-#define PROT_READ  0x1
-#define PROT_WRITE 0x2
-#define PROT_EXEC   0x4
-#define MAP_SHARED  0x1
-#define MAP_PRIVATE 0x2
 
 struct stat;
 
@@ -32,8 +27,8 @@ int uptime(void);
 int sync(void);
 int sigalarm(int, void (*)(void));
 int sigreturn(void);
-int symlink(char *, char *);
-void *mmap(void *, uint64, int, int, int, int);
+int symlink(const char *, const char *);
+void *mmap(void *, uint64, int, int, int, uint64);
 int munmap(void *, uint64);
 
 // ulib.c

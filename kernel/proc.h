@@ -113,7 +113,8 @@ struct proc {
     uint64 len;
     int prot;
     int flags;
-    int offset;
+    uint64 offset;
     struct file *file;
   } mmap_regions[NMMAP];
+  pagetable_t mmap_pagetable;
 };

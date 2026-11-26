@@ -25,7 +25,7 @@
 // Disk layout:
 // [ boot block | sb block | log | inode blocks | free bit map | data blocks ]
 
-int nbitmap = FSSIZE / BPB + 1;
+int nbitmap = (FSSIZE + BPB - 1) / BPB;
 int ninodeblocks = NINODES / IPB + 1;
 int nlog = LOGBLOCKS + 1; // Header followed by LOGBLOCKS data blocks.
 int nmeta;   // Number of meta blocks (boot, sb, nlog, inode, bitmap)
@@ -241,16 +241,15 @@ void
 balloc(int used)
 {
   uchar buf[BSIZE];
-  int i;
 
   printf("balloc: first %d blocks have been allocated\n", used);
-  assert(used < BPB);
-  bzero(buf, BSIZE);
-  for (i = 0; i < used; i++) {
-    buf[i / 8] = buf[i / 8] | (0x1 << (i % 8));
+  assert(used <= FSSIZE);
+  for (int block = 0; used > 0; block++, used -= BPB) {
+    bzero(buf, BSIZE);
+    for (int i = 0; i < used && i < BPB; i++)
+      buf[i / 8] |= 1 << (i % 8);
+    wsect(xint(sb.bmapstart) + block, buf);
   }
-  printf("balloc: write bitmap block at sector %d\n", sb.bmapstart);
-  wsect(sb.bmapstart, buf);
 }
 
 #define min(a, b) ((a) < (b) ? (a) : (b))
@@ -291,10 +290,8 @@ iappend(uint inum, void *xp, int n)
       uint first = doubly / NINDIRECT;
       uint second = doubly % NINDIRECT;
       uint indirect2[NINDIRECT];
-      if (xint(din.addrs[NDIRECT + 1]) == 0) {
+      if (xint(din.addrs[NDIRECT + 1]) == 0)
         din.addrs[NDIRECT + 1] = xint(freeblock++);
-        wsect(xint(din.addrs[NDIRECT + 1]), (char *)zeroes);
-      }
       rsect(xint(din.addrs[NDIRECT + 1]), (char *)indirect);
       if (indirect[first] == 0) {
         indirect[first] = xint(freeblock++);

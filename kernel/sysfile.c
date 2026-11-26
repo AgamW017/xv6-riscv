@@ -35,8 +35,6 @@ argfd(int n, int *pfd, struct file **pf)
   return 0;
 }
 
-static struct inode *create(char *, short, short, short);
-
 // Allocate a file descriptor for the given file.
 // Takes over file reference from caller on success.
 static int
@@ -172,30 +170,6 @@ bad:
   return -1;
 }
 
-uint64
-sys_symlink(void)
-{
-  char target[MAXPATH], path[MAXPATH];
-  struct inode *ip;
-
-  if (argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
-    return -1;
-  begin_op();
-  if ((ip = create(path, T_SYMLINK, 0, 0)) == 0) {
-    end_op();
-    return -1;
-  }
-  int len = strlen(target) + 1;
-  if (writei(ip, 0, (uint64)target, 0, len) != len) {
-    iunlockput(ip);
-    end_op();
-    return -1;
-  }
-  iunlockput(ip);
-  end_op();
-  return 0;
-}
-
 // Is the directory dp empty except for "." and ".." ?
 static int
 isdirempty(struct inode *dp)
@@ -270,7 +244,7 @@ bad:
 }
 
 static struct inode *
-create(char *path, short type, short major, short minor)
+create_inode(char *path, short type, short major, short minor, char *target)
 {
   struct inode *ip, *dp;
   char name[DIRSIZ];
@@ -288,7 +262,8 @@ create(char *path, short type, short major, short minor)
   if ((ip = dirlookup(dp, name, 0)) != 0) {
     iunlockput(dp);
     ilock(ip);
-    if (type == T_FILE && (ip->type == T_FILE || ip->type == T_DEVICE))
+    if (type == T_FILE && (ip->type == T_FILE || ip->type == T_DEVICE ||
+                           ip->type == T_SYMLINK))
       return ip;
     iunlockput(ip);
     return 0;
@@ -308,6 +283,12 @@ create(char *path, short type, short major, short minor)
   if (type == T_DIR) { // Create . and .. entries.
     // No ip->nlink++ for ".": avoid cyclic ref count.
     if (dirlink(ip, ".", ip->inum) < 0 || dirlink(ip, "..", dp->inum) < 0)
+      goto fail;
+  }
+
+  if (target) {
+    int len = strlen(target) + 1;
+    if (writei(ip, 0, (uint64)target, 0, len) != len)
       goto fail;
   }
 
@@ -331,6 +312,53 @@ fail:
   iunlockput(ip);
   iunlockput(dp);
   return 0;
+}
+
+static struct inode *
+create(char *path, short type, short major, short minor)
+{
+  return create_inode(path, type, major, minor, 0);
+}
+
+uint64
+sys_symlink(void)
+{
+  char target[MAXPATH], path[MAXPATH];
+
+  if (argstr(0, target, MAXPATH) <= 0 || argstr(1, path, MAXPATH) <= 0)
+    return -1;
+  begin_op();
+  struct inode *ip = create_inode(path, T_SYMLINK, 0, 0, target);
+  if (ip)
+    iunlockput(ip);
+  end_op();
+  return ip ? 0 : -1;
+}
+
+// Resolve the final path component for open(). Each relative target is
+// interpreted from the directory containing its symlink.
+static struct inode *
+follow_symlink(struct inode *ip, char *path)
+{
+  char name[DIRSIZ], target[MAXPATH];
+  struct inode *dir = nameiparent(path, name);
+
+  for (int depth = 0; ip && ip->type == T_SYMLINK; depth++) {
+    uint len = ip->size;
+    int valid = depth < 10 && len > 1 && len <= sizeof(target) &&
+                readi(ip, 0, (uint64)target, 0, len) == len && target[len - 1] == 0;
+    iunlockput(ip);
+    struct inode *parent = 0;
+    ip = valid && (*target == '/' || dir) ? namei_from(dir, target, &parent) : 0;
+    if (dir)
+      iput(dir);
+    dir = parent;
+    if (ip)
+      ilock(ip);
+  }
+  if (dir)
+    iput(dir);
+  return ip;
 }
 
 uint64
@@ -360,34 +388,16 @@ sys_open(void)
       return -1;
     }
     ilock(ip);
-    for (int depth = 0; ip->type == T_SYMLINK &&
-                         !(omode & O_NOFOLLOW) && depth < 10; depth++) {
-      char target[MAXPATH];
-      int nread = readi(ip, 0, (uint64)target, 0, sizeof(target) - 1);
-      iunlockput(ip);
-      if (nread <= 0) {
-        ip = 0;
-        break;
-      }
-      target[nread] = 0;
-      if ((ip = namei(target)) == 0)
-        break;
-      ilock(ip);
-    }
-    if (ip && ip->type == T_SYMLINK && !(omode & O_NOFOLLOW)) {
-      iunlockput(ip);
-      end_op();
-      return -1;
-    }
-    if (ip == 0) {
-      end_op();
-      return -1;
-    }
-    if (ip->type == T_DIR && omode != O_RDONLY) {
-      iunlockput(ip);
-      end_op();
-      return -1;
-    }
+  }
+  if (ip->type == T_SYMLINK && !(omode & O_NOFOLLOW) &&
+      (ip = follow_symlink(ip, path)) == 0) {
+    end_op();
+    return -1;
+  }
+  if (ip->type == T_DIR && omode != O_RDONLY) {
+    iunlockput(ip);
+    end_op();
+    return -1;
   }
 
   if (ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)) {
@@ -429,7 +439,7 @@ uint64
 sys_mmap(void)
 {
   uint64 requested, len, offset;
-  int prot, flags, fd;
+  int prot, flags;
   struct file *f;
   struct proc *p = myproc();
 
@@ -437,54 +447,44 @@ sys_mmap(void)
   argaddr(1, &len);
   argint(2, &prot);
   argint(3, &flags);
-  argint(4, &fd);
   argaddr(5, &offset);
-  if (requested != 0 || len == 0 || offset != 0 ||
-      (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0 ||
+  if (requested != 0 || len == 0 || len >= TRAPFRAME || offset != 0 ||
+      prot == 0 || (prot & ~(PROT_READ | PROT_WRITE)) != 0 ||
       (flags != MAP_SHARED && flags != MAP_PRIVATE) ||
       argfd(4, 0, &f) < 0 || f->type != FD_INODE ||
-      f->ip->type != T_FILE)
-    return (uint64)-1;
-  len = PGROUNDUP(len);
-  if (len >= TRAPFRAME ||
-      ((prot & PROT_READ) && !f->readable) ||
-      ((prot & PROT_WRITE) && !f->writable))
-    return (uint64)-1;
+      f->ip->type != T_FILE || !f->readable ||
+      (flags == MAP_SHARED && (prot & PROT_WRITE) && !f->writable))
+    return -1;
 
-  int slot = -1;
+  struct mmap_region *slot = 0;
   for (int i = 0; i < NMMAP; i++)
-    if (p->mmap_regions[i].file == 0) {
-      slot = i;
+    if (!p->mmap_regions[i].file) {
+      slot = &p->mmap_regions[i];
       break;
     }
-  if (slot < 0)
-    return (uint64)-1;
+  if (!slot)
+    return -1;
 
-  uint64 addr = TRAPFRAME - len;
-  for (;;) {
-    int overlap = 0;
+  uint64 span = PGROUNDUP(len);
+  uint64 top = TRAPFRAME;
+  uint64 floor = PGROUNDUP(p->sz);
+  while (top >= floor && top - floor >= span) {
+    uint64 addr = top - span;
+    uint64 next = top;
     for (int i = 0; i < NMMAP; i++) {
-      if (p->mmap_regions[i].file &&
-          addr < p->mmap_regions[i].addr + p->mmap_regions[i].len &&
-          addr + len > p->mmap_regions[i].addr) {
-        overlap = 1;
-        break;
-      }
+      struct mmap_region *m = &p->mmap_regions[i];
+      if (m->file && m->addr < next && addr < m->addr + PGROUNDUP(m->len))
+        next = m->addr;
     }
-    if (!overlap && addr >= p->sz)
-      break;
-    if (addr < len + PGSIZE)
-      return (uint64)-1;
-    addr -= len;
+    if (next == top) {
+      *slot = (struct mmap_region){.addr = addr, .len = len, .prot = prot,
+                                  .flags = flags, .file = filedup(f)};
+      p->mmap_pagetable = p->pagetable;
+      return addr;
+    }
+    top = next;
   }
-
-  p->mmap_regions[slot].addr = addr;
-  p->mmap_regions[slot].len = len;
-  p->mmap_regions[slot].prot = prot;
-  p->mmap_regions[slot].flags = flags;
-  p->mmap_regions[slot].offset = 0;
-  p->mmap_regions[slot].file = filedup(f);
-  return addr;
+  return -1;
 }
 
 uint64
@@ -493,9 +493,7 @@ sys_munmap(void)
   uint64 addr, len;
   argaddr(0, &addr);
   argaddr(1, &len);
-  if (len == 0 || addr % PGSIZE != 0)
-    return -1;
-  return munmap_region(myproc(), addr, PGROUNDUP(len));
+  return munmap_region(myproc(), addr, len);
 }
 
 uint64
@@ -590,6 +588,13 @@ sys_exec(void)
   }
 
   int ret = kexec(path, argv);
+  if (ret >= 0) {
+    struct proc *p = myproc();
+    p->alarm_interval = 0;
+    p->alarm_ticks = 0;
+    p->alarm_handler = 0;
+    p->alarm_active = 0;
+  }
 
   for (i = 0; i < NELEM(argv) && argv[i] != 0; i++)
     kfree(argv[i]);

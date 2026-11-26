@@ -213,6 +213,10 @@ proc_pagetable(struct proc *p)
 void
 proc_freepagetable(pagetable_t pagetable, uint64 sz)
 {
+  struct proc *p = myproc();
+  // A successful exec replaces the current page table before freeing it.
+  if (p && pagetable == p->mmap_pagetable)
+    mmap_clear(p);
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
   uvmunmap(pagetable, TRAPFRAME, 1, 0);
   uvmfree(pagetable, sz);
@@ -278,9 +282,18 @@ kfork(void)
     return -1;
   }
   np->sz = p->sz;
+  if (mmap_fork(p, np) < 0) {
+    freeproc(np);
+    release(&np->lock);
+    return -1;
+  }
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
+  if (p->alarm_active) {
+    np->alarm_active = 1;
+    np->alarm_trapframe = p->alarm_trapframe;
+  }
 
   // Cause fork to return 0 in the child.
   np->trapframe->a0 = 0;
@@ -290,12 +303,6 @@ kfork(void)
     if (p->ofile[i])
       np->ofile[i] = filedup(p->ofile[i]);
   np->cwd = idup(p->cwd);
-
-  for (i = 0; i < NMMAP; i++) {
-    np->mmap_regions[i] = p->mmap_regions[i];
-    if (np->mmap_regions[i].file)
-      filedup(np->mmap_regions[i].file);
-  }
 
   safestrcpy(np->name, p->name, sizeof(p->name));
 
@@ -340,14 +347,7 @@ kexit(int status)
   if (p == initproc)
     panic("init exiting");
 
-  for (int i = 0; i < NMMAP; i++) {
-    if (p->mmap_regions[i].file) {
-      uint64 addr = p->mmap_regions[i].addr;
-      uint64 len = p->mmap_regions[i].len;
-      if (munmap_region(p, addr, len) < 0)
-        panic("kexit: munmap");
-    }
-  }
+  mmap_clear(p);
 
   // Close all open files.
   for (int fd = 0; fd < NOFILE; fd++) {
