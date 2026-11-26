@@ -217,8 +217,8 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
   struct proc *p = myproc();
   // A successful exec frees the old page table after installing the new
   // one. Release the file mappings while their entries can still be read.
-  if (p && pagetable == p->mmap_pagetable)
-    mmap_clear(p);
+  if (p && pagetable == p->mmap_pagetable) // Does this table own the mappings?
+    mmap_clear(p);                        // Flush and release them first.
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
   uvmunmap(pagetable, TRAPFRAME, 1, 0);
   uvmfree(pagetable, sz);
@@ -285,10 +285,10 @@ kfork(void)
   }
   np->sz = p->sz;
   // The ordinary memory copy above ends at p->sz. File mappings live higher.
-  if (mmap_fork(p, np) < 0) {
-    freeproc(np);
-    release(&np->lock);
-    return -1;
+  if (mmap_fork(p, np) < 0) { // Copy the file mapping records and resident pages.
+    freeproc(np);            // Discard the child if mapping setup failed.
+    release(&np->lock);      // Drop the lock held by allocproc.
+    return -1;               // Report the failed fork to the parent.
   }
 
   // copy saved user registers.

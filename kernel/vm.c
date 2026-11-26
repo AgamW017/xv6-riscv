@@ -11,7 +11,7 @@
 #include "file.h"
 #include "fcntl.h"
 
-#define PTE_D (1L << 7) // RISC-V dirty bit
+#define PTE_D (1L << 7) // Bit 7 of the RISC-V page-table entry marks a write.
 
 /*
  * the kernel's page table.
@@ -372,8 +372,9 @@ copyout(pagetable_t pagetable, uint64 psz, uint64 dstva, char *src, uint64 len)
     n = PGSIZE - (dstva - va0);
     if (n > len)
       n = len;
+    // Copy directly into RAM, so the CPU does not update the user page entry.
     memmove((void *)(pa0 + (dstva - va0)), src, n);
-    *pte |= PTE_D; // Kernel writes through the physical address bypass the user PTE.
+    *pte |= PTE_D; // Record that the kernel changed the user's page.
 
     len -= n;
     src += n;
@@ -499,101 +500,110 @@ ismapped(pagetable_t pagetable, uint64 va)
 int
 mmapfault(struct proc *p, uint64 faultva, int write)
 {
+  // A fault can occur at any byte. Round down to the start of its page.
   uint64 va = PGROUNDDOWN(faultva);
+
+  // Find the mapping record that owns this address.
   struct mmap_region *m = 0;
   for (int i = 0; i < NMMAP; i++) {
     struct mmap_region *candidate = &p->mmap_regions[i];
+
+    // The slot must be in use, and va must fall inside its address range.
     if (candidate->file && va >= candidate->addr &&
         va - candidate->addr < candidate->len) {
       m = candidate;
-      break;
+      break; // Mapping ranges are separate, so the search is done.
     }
   }
-  // Load missing file pages here. An existing entry may have faulted on
-  // permissions, and must keep its current page-table protections.
+
+  // A store requires PROT_WRITE. An existing page can fault on protections
+  // and must keep its page-table entry.
   if (!m || (write && !(m->prot & PROT_WRITE)) || ismapped(p->pagetable, va))
-    return 0;
+    return 0; // Leave this fault to the other xv6 handlers.
 
-  char *mem = kalloc();
+  char *mem = kalloc(); // Allocate one physical page of RAM.
   if (!mem)
-    return 0;
-  // Any part of the page beyond the requested bytes or EOF stays zero.
-  memset(mem, 0, PGSIZE);
+    return 0; // Allocation failed.
+  memset(mem, 0, PGSIZE); // Bytes outside the file or requested range stay zero.
 
-  struct inode *ip = m->file->ip;
-  // Use the page's position in the mapping, independent of the fd's offset.
-  uint64 rel = va - m->addr;
-  uint64 off = m->offset + rel;
-  ilock(ip);
-  uint64 len = m->len - rel;
+  struct inode *ip = m->file->ip; // Inode for the backing file.
+  uint64 rel = va - m->addr;      // Distance from the start of the mapping.
+  uint64 off = m->offset + rel;   // File byte offset, independent of the fd.
+  ilock(ip);                     // Protect the inode while checking and reading.
+  uint64 len = m->len - rel;      // Bytes left in the mapping from this page.
   if (len > PGSIZE)
-    len = PGSIZE;
+    len = PGSIZE;                 // Load at most one page for this fault.
   if (off >= ip->size)
-    len = 0;
+    len = 0;                      // The page starts at or past the end of file.
   else if (len > ip->size - off)
-    len = ip->size - off;
-  int n = len ? readi(ip, 0, (uint64)mem, off, len) : 0;
-  iunlock(ip);
+    len = ip->size - off;         // Read only the bytes that exist in the file.
 
-  // Sv39 requires read permission on writable pages.
-  int perm = PTE_U | PTE_R;
+  // The 0 says mem is a kernel buffer. Skip the read for an all-zero page.
+  int n = len ? readi(ip, 0, (uint64)mem, off, len) : 0;
+  iunlock(ip);                    // The file read is finished.
+
+  // RISC-V requires read permission on writable pages.
+  int perm = PTE_U | PTE_R;        // Give user mode read access to the page.
   if (m->prot & PROT_WRITE)
-    perm |= PTE_W;
+    perm |= PTE_W;                 // Add write permission when allowed.
+
+  // Check the read, then connect virtual address va to the RAM page mem.
   if (n != len || mappages(p->pagetable, va, PGSIZE, (uint64)mem, perm) < 0) {
-    kfree(mem);
-    return 0;
+    kfree(mem);                    // Give back the RAM if setup failed.
+    return 0;                      // Report that the fault remains unresolved.
   }
-  return 1;
+  return 1;                        // User mode can retry the faulting instruction.
 }
 
-// A missing leaf page table leaves the rest of its 2 MiB range unmapped.
+// Find the next resident page and update the caller's address in place.
 static pte_t *
 mmap_next_page(pagetable_t pagetable, uint64 *addr, uint64 end)
 {
-  const uint64 leaf_span = 512 * PGSIZE;
-  while (*addr < end) {
-    pte_t *pte = walk(pagetable, *addr, 0);
+  const uint64 leaf_span = 512 * PGSIZE;  // One leaf page table covers 2 MiB.
+  while (*addr < end) {                   // Scan only the requested range.
+    pte_t *pte = walk(pagetable, *addr, 0); // Look up the entry without allocating.
     if (pte && (*pte & PTE_V))
-      return pte;
+      return pte;                        // This page has physical memory.
     if (pte)
-      *addr += PGSIZE;
+      *addr += PGSIZE;                   // Skip an empty entry in an existing table.
     else
-      *addr = (*addr / leaf_span + 1) * leaf_span;
+      *addr = (*addr / leaf_span + 1) * leaf_span; // Skip the missing leaf table.
   }
-  return 0;
+  return 0;                              // No more resident pages in the range.
 }
 
 static void
 mmap_writeback(struct mmap_region *m, uint64 va, uint64 pa)
 {
-  struct inode *ip = m->file->ip;
-  uint64 rel = va - m->addr;
-  uint64 off = m->offset + rel;
+  struct inode *ip = m->file->ip; // Get the backing file's inode.
+  uint64 rel = va - m->addr;      // Page position within the mapping.
+  uint64 off = m->offset + rel;   // Corresponding byte position in the file.
 
-  begin_op();
-  ilock(ip);
-  // Clip writes to the mapping's byte length and the current end of the file.
-  if (off < ip->size) {
-    uint64 n = m->len - rel;
+  begin_op();                   // Start an xv6 filesystem log operation.
+  ilock(ip);                    // Protect the file size and the write.
+  if (off < ip->size) {           // Write only if the page overlaps the file.
+    uint64 n = m->len - rel;      // Bytes left in the requested mapping.
     if (n > PGSIZE)
-      n = PGSIZE;
+      n = PGSIZE;                // Save at most one page.
     if (n > ip->size - off)
-      n = ip->size - off;
-    writei(ip, 0, pa, off, n);
+      n = ip->size - off;        // Stop at the current end of the file.
+    writei(ip, 0, pa, off, n);   // Write from kernel-accessible RAM.
   }
-  iunlock(ip);
-  end_op();
+  iunlock(ip);                  // Release the inode lock.
+  end_op();                     // Finish the filesystem log operation.
 }
 
 static void
 mmap_release(pagetable_t pagetable, struct mmap_region *m, uint64 start, uint64 end)
 {
-  pte_t *pte;
+  pte_t *pte; // A page-table entry stores the RAM address and flags.
+
+  // Find each page that was loaded. Resume the search at the next page.
   for (uint64 va = start; (pte = mmap_next_page(pagetable, &va, end)); va += PGSIZE) {
-    // A clean page may contain an old copy of bytes another writer updated.
-    if (m->flags == MAP_SHARED && (*pte & PTE_D))
-      mmap_writeback(m, va, PTE2PA(*pte));
-    uvmunmap(pagetable, va, 1, 1);
+    // A clean page may hold an old copy of bytes another writer updated.
+    if (m->flags == MAP_SHARED && (*pte & PTE_D)) // Save only dirty shared pages.
+      mmap_writeback(m, va, PTE2PA(*pte));        // Extract the page's RAM address.
+    uvmunmap(pagetable, va, 1, 1);                // Remove one page and free its RAM.
   }
 }
 
@@ -601,90 +611,97 @@ void
 mmap_clear(struct proc *p)
 {
   for (int i = 0; i < NMMAP; i++) {
-    struct mmap_region *m = &p->mmap_regions[i];
+    struct mmap_region *m = &p->mmap_regions[i]; // Get one mapping slot.
     if (!m->file)
-      continue;
+      continue;                              // Skip unused slots.
+
+    // Flush and free the pages using the page table that actually owns them.
     mmap_release(p->mmap_pagetable, m, m->addr, m->addr + m->len);
-    fileclose(m->file);
-    memset(m, 0, sizeof(*m));
+    fileclose(m->file);                       // Drop the mapping's file reference.
+    memset(m, 0, sizeof(*m));                 // Clear the slot for reuse.
   }
-  p->mmap_pagetable = 0;
+  p->mmap_pagetable = 0;                      // No page table now owns mappings.
 }
 
 int
 mmap_fork(struct proc *parent, struct proc *child)
 {
   for (int i = 0; i < NMMAP; i++) {
-    struct mmap_region *m = &parent->mmap_regions[i];
+    struct mmap_region *m = &parent->mmap_regions[i]; // Get the parent's slot.
     if (!m->file)
-      continue;
+      continue;                                    // Skip unused slots.
 
-    child->mmap_regions[i] = *m;
-    child->mmap_regions[i].file = filedup(m->file);
-    child->mmap_pagetable = child->pagetable;
-    pte_t *pte;
-    // Copy resident pages so the child sees the parent's current bytes.
-    // Untouched pages will load on demand in the child.
+    child->mmap_regions[i] = *m;                    // Copy address, length, and flags.
+    child->mmap_regions[i].file = filedup(m->file);  // The child owns a reference.
+    child->mmap_pagetable = child->pagetable;        // Record which page table owns it.
+    pte_t *pte;                                    // The current loaded parent page.
+
+    // Copy the bytes already in RAM. Untouched pages stay lazy in the child.
     for (uint64 va = m->addr;
          (pte = mmap_next_page(parent->pagetable, &va, m->addr + m->len));
          va += PGSIZE) {
-      char *mem = kalloc();
+      char *mem = kalloc();                       // A separate RAM page for the child.
       if (!mem)
-        goto fail;
-      memmove(mem, (void *)PTE2PA(*pte), PGSIZE);
-      // Only new writes by the child are written back by the child.
+        goto fail;                               // Undo the mapping work so far.
+      memmove(mem, (void *)PTE2PA(*pte), PGSIZE);  // Copy what the parent sees.
+
+      // Keep the permissions and clear the child's dirty bit. Only writes
+      // made by the child should get written back by the child.
       if (mappages(child->pagetable, va, PGSIZE, (uint64)mem,
                    PTE_FLAGS(*pte) & ~PTE_D) < 0) {
-        kfree(mem);
-        goto fail;
+        kfree(mem);                              // The page was never installed.
+        goto fail;                               // Clean up the earlier copies too.
       }
     }
   }
-  return 0;
+  return 0;                                      // All active mappings copied.
 
 fail:
   // Child pages are clean, and the parent still holds each file reference.
-  mmap_clear(child);
-  return -1;
+  mmap_clear(child);                             // Free the partial copy.
+  return -1;                                     // Let kfork fail and free the child.
 }
 
 uint64
 mmap_limit(struct proc *p)
 {
-  uint64 limit = TRAPFRAME;
-  for (int i = 0; i < NMMAP; i++)
+  uint64 limit = TRAPFRAME;                   // Ceiling when no file is mapped.
+  for (int i = 0; i < NMMAP; i++)              // Check every mapping slot.
     if (p->mmap_regions[i].file && p->mmap_regions[i].addr < limit)
-      limit = p->mmap_regions[i].addr;
-  return limit;
+      limit = p->mmap_regions[i].addr;        // Use it as the new heap ceiling.
+  return limit;                              // The heap can grow up to this address.
 }
 
 int
 munmap_region(struct proc *p, uint64 addr, uint64 len)
 {
+  // Require a page-aligned start, positive length, and a range below TRAPFRAME.
   if (addr >= TRAPFRAME || addr % PGSIZE || !len || len > TRAPFRAME - addr)
     return -1;
-  uint64 end = addr + PGROUNDUP(len);
+
+  uint64 end = addr + PGROUNDUP(len); // First address after the pages being removed.
   for (int i = 0; i < NMMAP; i++) {
-    struct mmap_region *m = &p->mmap_regions[i];
-    uint64 mend = m->addr + PGROUNDUP(m->len);
-    // A partial unmap must start or end on an edge of the mapping.
+    struct mmap_region *m = &p->mmap_regions[i];   // Check one mapping slot.
+    uint64 mend = m->addr + PGROUNDUP(m->len);    // End of its page-aligned range.
+
+    // The range must be inside one active mapping. Reject a hole in the middle.
     if (!m->file || addr < m->addr || end > mend ||
         (addr != m->addr && end != mend))
       continue;
 
+    // Writeback needs the old address and offset, so release before editing m.
     mmap_release(p->pagetable, m, addr, end);
     if (addr != m->addr) {
-      m->len = addr - m->addr;
+      m->len = addr - m->addr;     // Removed the end. Keep the preceding bytes.
     } else if (end != mend) {
-      m->addr = end;
-      m->len -= end - addr;
-      // The first surviving page still refers to the same bytes in the file.
-      m->offset += end - addr;
+      m->addr = end;              // Removed the beginning. Move the start forward.
+      m->len -= end - addr;       // Shorten the remaining mapping.
+      m->offset += end - addr;    // Advance the remaining mapping's file offset.
     } else {
-      fileclose(m->file);
-      memset(m, 0, sizeof(*m));
+      fileclose(m->file);         // Removed the whole range. Drop its file reference.
+      memset(m, 0, sizeof(*m));   // Make this slot available to the next mmap.
     }
-    return 0;
+    return 0;                    // The unmap succeeded.
   }
-  return -1;
+  return -1;                     // No mapping accepted the range.
 }

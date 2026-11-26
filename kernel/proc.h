@@ -110,10 +110,10 @@ struct proc {
 
   // A mapping reserves an address range. File pages are loaded on access.
   struct mmap_region {
-    uint64 addr;
-    uint64 len;      // Requested bytes before rounding up to whole pages.
-    int prot;
-    int flags;
+    uint64 addr;    // First virtual address of the mapping.
+    uint64 len;     // Requested bytes before rounding up to whole pages.
+    int prot;       // Read and write permissions.
+    int flags;      // Whether changes are shared or private.
     uint64 offset;   // File offset corresponding to addr.
     struct file *file; // Owned file reference, or 0 for an unused slot.
   } mmap_regions[NMMAP];

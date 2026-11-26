@@ -45,10 +45,10 @@ sys_sbrk(void)
 
   argint(0, &n);
   argint(1, &t);
-  addr = myproc()->sz;
-  // Keep both eager and lazy heap growth below the lowest file mapping.
+  addr = myproc()->sz; // Current end of the heap.
+  // Both eager and lazy growth must stop at the lowest file mapping.
   if (n > 0 && addr + n > mmap_limit(myproc()))
-    return -1;
+    return -1; // The new heap would overlap a mapped file.
 
   if (t == SBRK_EAGER || n < 0) {
     if (growproc(n) < 0) {

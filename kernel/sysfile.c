@@ -444,18 +444,20 @@ sys_open(void)
 uint64
 sys_mmap(void)
 {
-  uint64 requested, len, offset;
-  int prot, flags;
-  struct file *f;
-  struct proc *p = myproc();
+  uint64 requested, len, offset; // Address, byte length, and starting file offset.
+  int prot, flags;                // Access permissions and shared/private mode.
+  struct file *f;                 // Backing file obtained from the descriptor.
+  struct proc *p = myproc();      // The mapping belongs to this process.
 
-  argaddr(0, &requested);
-  argaddr(1, &len);
-  argint(2, &prot);
-  argint(3, &flags);
-  argaddr(5, &offset);
-  // The caller lets xv6 pick the address and maps from file offset zero.
-  // Faults need a readable file. Shared writes also need write access.
+  argaddr(0, &requested);         // Read the requested address.
+  argaddr(1, &len);               // Read the requested byte count.
+  argint(2, &prot);               // Read PROT_READ and PROT_WRITE bits.
+  argint(3, &flags);              // Read MAP_SHARED or MAP_PRIVATE.
+  argaddr(5, &offset);             // Read the file offset. argfd below reads fd.
+
+  // xv6 chooses the address and starts at file offset zero. Require a valid
+  // size, supported flags, and a readable regular file. A writable shared
+  // mapping also needs permission to update the file.
   if (requested != 0 || len == 0 || len >= TRAPFRAME || offset != 0 ||
       prot == 0 || (prot & ~(PROT_READ | PROT_WRITE)) != 0 ||
       (flags != MAP_SHARED && flags != MAP_PRIVATE) ||
@@ -464,46 +466,46 @@ sys_mmap(void)
       (flags == MAP_SHARED && (prot & PROT_WRITE) && !f->writable))
     return -1;
 
-  struct mmap_region *slot = 0;
+  struct mmap_region *slot = 0;  // Find a free entry in the mapping table.
   for (int i = 0; i < NMMAP; i++)
     if (!p->mmap_regions[i].file) {
-      slot = &p->mmap_regions[i];
-      break;
+      slot = &p->mmap_regions[i]; // A slot with no file is unused.
+      break;                     // Use the first available slot.
     }
   if (!slot)
-    return -1;
+    return -1;                   // All mapping slots are occupied.
 
-  // Search downward in whole pages, keeping len as the file I/O limit.
-  uint64 span = PGROUNDUP(len);
-  uint64 top = TRAPFRAME;
-  uint64 floor = PGROUNDUP(p->sz);
-  while (top >= floor && top - floor >= span) {
-    uint64 addr = top - span;
-    uint64 next = top;
+  uint64 span = PGROUNDUP(len);   // Reserve pages, but keep len for byte limits.
+  uint64 top = TRAPFRAME;         // Start the search below the trapframe.
+  uint64 floor = PGROUNDUP(p->sz); // Stay above the existing process memory.
+
+  while (top >= floor && top - floor >= span) { // While the candidate can fit.
+    uint64 addr = top - span;     // Candidate start directly below top.
+    uint64 next = top;            // If this changes, an existing mapping overlaps.
     for (int i = 0; i < NMMAP; i++) {
       struct mmap_region *m = &p->mmap_regions[i];
       if (m->file && m->addr < next && addr < m->addr + PGROUNDUP(m->len))
-        next = m->addr;
+        next = m->addr;          // Move below the overlapping mapping.
     }
-    if (next == top) {
-      // Reserve the range and keep the file open even after close(fd).
+    if (next == top) {            // No overlap, so reserve this range.
+      // Keep a reference so the file remains available after close(fd).
       *slot = (struct mmap_region){.addr = addr, .len = len, .prot = prot,
                                   .flags = flags, .file = filedup(f)};
-      p->mmap_pagetable = p->pagetable;
-      return addr;
+      p->mmap_pagetable = p->pagetable; // Record the owner for later cleanup.
+      return addr;               // Pages will be loaded on demand by mmapfault.
     }
-    top = next; // Try below the mapping that overlapped this range.
+    top = next;                  // Try the lower gap.
   }
-  return -1;
+  return -1;                     // The address space has no suitable gap.
 }
 
 uint64
 sys_munmap(void)
 {
-  uint64 addr, len;
-  argaddr(0, &addr);
-  argaddr(1, &len);
-  return munmap_region(myproc(), addr, len);
+  uint64 addr, len;     // Starting address and byte count from user space.
+  argaddr(0, &addr);     // Read the first syscall argument.
+  argaddr(1, &len);      // Read the second syscall argument.
+  return munmap_region(myproc(), addr, len); // Unmap in the current process.
 }
 
 uint64

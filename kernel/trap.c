@@ -70,7 +70,9 @@ usertrap(void)
     // ok
   } else if ((r_scause() == 15 || r_scause() == 13) &&
              mmapfault(p, r_stval(), r_scause() == 15)) {
-    // The file page is ready. The faulting instruction will retry on return.
+    // Cause 15 is a write fault and cause 13 is a read fault. r_stval()
+    // gives the address that triggered it, and the last argument marks a write.
+    // mmapfault returned 1, so the instruction can retry in user mode.
   } else if ((r_scause() == 15 || r_scause() == 13) &&
              vmfault(p->pagetable, p->sz, r_stval(),
                      (r_scause() == 13) ? 1 : 0) != 0) {
