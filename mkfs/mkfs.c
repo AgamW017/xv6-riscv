@@ -25,6 +25,7 @@
 // Disk layout:
 // [ boot block | sb block | log | inode blocks | free bit map | data blocks ]
 
+// Round up so the bitmap can represent every block in the larger image.
 int nbitmap = (FSSIZE + BPB - 1) / BPB;
 int ninodeblocks = NINODES / IPB + 1;
 int nlog = LOGBLOCKS + 1; // Header followed by LOGBLOCKS data blocks.
@@ -244,6 +245,7 @@ balloc(int used)
 
   printf("balloc: first %d blocks have been allocated\n", used);
   assert(used <= FSSIZE);
+  // Mark the used prefix, including metadata, across the bitmap blocks.
   for (int block = 0; used > 0; block++, used -= BPB) {
     bzero(buf, BSIZE);
     for (int i = 0; i < used && i < BPB; i++)
@@ -286,6 +288,7 @@ iappend(uint inum, void *xp, int n)
       }
       x = xint(indirect[fbn - NDIRECT]);
     } else {
+      // Use the same two table indexes as the kernel's bmap.
       uint doubly = fbn - NDIRECT - NINDIRECT;
       uint first = doubly / NINDIRECT;
       uint second = doubly % NINDIRECT;

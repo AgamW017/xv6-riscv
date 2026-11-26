@@ -509,15 +509,19 @@ mmapfault(struct proc *p, uint64 faultva, int write)
       break;
     }
   }
+  // Load missing file pages here. An existing entry may have faulted on
+  // permissions, and must keep its current page-table protections.
   if (!m || (write && !(m->prot & PROT_WRITE)) || ismapped(p->pagetable, va))
     return 0;
 
   char *mem = kalloc();
   if (!mem)
     return 0;
+  // Any part of the page beyond the requested bytes or EOF stays zero.
   memset(mem, 0, PGSIZE);
 
   struct inode *ip = m->file->ip;
+  // Use the page's position in the mapping, independent of the fd's offset.
   uint64 rel = va - m->addr;
   uint64 off = m->offset + rel;
   ilock(ip);
@@ -568,6 +572,7 @@ mmap_writeback(struct mmap_region *m, uint64 va, uint64 pa)
 
   begin_op();
   ilock(ip);
+  // Clip writes to the mapping's byte length and the current end of the file.
   if (off < ip->size) {
     uint64 n = m->len - rel;
     if (n > PGSIZE)
@@ -585,6 +590,7 @@ mmap_release(pagetable_t pagetable, struct mmap_region *m, uint64 start, uint64 
 {
   pte_t *pte;
   for (uint64 va = start; (pte = mmap_next_page(pagetable, &va, end)); va += PGSIZE) {
+    // A clean page may contain an old copy of bytes another writer updated.
     if (m->flags == MAP_SHARED && (*pte & PTE_D))
       mmap_writeback(m, va, PTE2PA(*pte));
     uvmunmap(pagetable, va, 1, 1);
@@ -617,6 +623,8 @@ mmap_fork(struct proc *parent, struct proc *child)
     child->mmap_regions[i].file = filedup(m->file);
     child->mmap_pagetable = child->pagetable;
     pte_t *pte;
+    // Copy resident pages so the child sees the parent's current bytes.
+    // Untouched pages will load on demand in the child.
     for (uint64 va = m->addr;
          (pte = mmap_next_page(parent->pagetable, &va, m->addr + m->len));
          va += PGSIZE) {
@@ -659,6 +667,7 @@ munmap_region(struct proc *p, uint64 addr, uint64 len)
   for (int i = 0; i < NMMAP; i++) {
     struct mmap_region *m = &p->mmap_regions[i];
     uint64 mend = m->addr + PGROUNDUP(m->len);
+    // A partial unmap must start or end on an edge of the mapping.
     if (!m->file || addr < m->addr || end > mend ||
         (addr != m->addr && end != mend))
       continue;
@@ -669,6 +678,7 @@ munmap_region(struct proc *p, uint64 addr, uint64 len)
     } else if (end != mend) {
       m->addr = end;
       m->len -= end - addr;
+      // The first surviving page still refers to the same bytes in the file.
       m->offset += end - addr;
     } else {
       fileclose(m->file);

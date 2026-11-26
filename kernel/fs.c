@@ -456,6 +456,7 @@ bmap(struct inode *ip, uint bn)
     return addr;
   }
 
+  // Skip the singly indirect range so bn starts at 0 for the double level.
   bn -= NINDIRECT;
   if (bn < NDOUBLY) {
     if ((addr = ip->addrs[NDIRECT + 1]) == 0) {
@@ -467,8 +468,8 @@ bmap(struct inode *ip, uint bn)
 
     bp = bread(ip->dev, addr);
     a = (uint *)bp->data;
-    uint first = bn / NINDIRECT;
-    uint second = bn % NINDIRECT;
+    uint first = bn / NINDIRECT;  // Select the second-level table.
+    uint second = bn % NINDIRECT; // Select the data block in that table.
     if ((addr = a[first]) == 0) {
       addr = balloc(ip->dev);
       if (addr) {
@@ -524,6 +525,7 @@ itrunc(struct inode *ip)
     ip->addrs[NDIRECT] = 0;
   }
 
+  // Free data blocks before the tables that hold their addresses.
   if (ip->addrs[NDIRECT + 1]) {
     bp = bread(ip->dev, ip->addrs[NDIRECT + 1]);
     a = (uint *)bp->data;
@@ -741,9 +743,11 @@ skipelem(char *path, char *name)
   return path;
 }
 
-// Look up and return the inode for a path name.
-// If parent != 0, return the inode for the parent and copy the final
-// path element into name, which must have room for DIRSIZ bytes.
+// Look up an inode. Relative paths start at base or the current directory.
+// If nameiparent is set, return the containing directory and copy the
+// final component into name, which must have room for DIRSIZ bytes.
+// The optional parent output keeps a reference to that directory for
+// resolving the next relative symlink target.
 // Must be called inside a transaction since it calls iput().
 static struct inode *
 namex(struct inode *base, char *path, int nameiparent, char *name,

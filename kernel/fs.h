@@ -23,6 +23,8 @@ struct superblock {
 
 #define FSMAGIC 0x10203040
 
+// Keep 13 address slots per inode. Slots 11 and 12 point to the singly
+// indirect and doubly indirect blocks, respectively.
 #define NDIRECT   11
 #define NINDIRECT (BSIZE / sizeof(uint))
 #define NDOUBLY   (NINDIRECT * NINDIRECT)

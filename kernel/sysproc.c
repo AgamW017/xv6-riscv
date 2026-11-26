@@ -46,6 +46,7 @@ sys_sbrk(void)
   argint(0, &n);
   argint(1, &t);
   addr = myproc()->sz;
+  // Keep both eager and lazy heap growth below the lowest file mapping.
   if (n > 0 && addr + n > mmap_limit(myproc()))
     return -1;
 
@@ -102,6 +103,7 @@ sys_sigalarm(void)
   if (interval < 0)
     return -1;
   struct proc *p = myproc();
+  // A handler can cancel future alarms and still finish with sigreturn.
   p->alarm_interval = interval;
   p->alarm_handler = handler;
   p->alarm_ticks = 0;

@@ -102,19 +102,20 @@ struct proc {
   struct inode *cwd;           // Current directory
   char name[16];               // Process name (debugging)
 
-  int alarm_interval;
-  int alarm_ticks;
-  uint64 alarm_handler;
-  int alarm_active;
-  struct trapframe alarm_trapframe;
+  int alarm_interval;              // User-mode ticks per alarm, or 0 to disable.
+  int alarm_ticks;                 // Ticks counted toward the next alarm.
+  uint64 alarm_handler;            // User address of the alarm handler.
+  int alarm_active;                // A delivered alarm is awaiting sigreturn.
+  struct trapframe alarm_trapframe; // Registers and PC saved at delivery.
 
+  // A mapping reserves an address range. File pages are loaded on access.
   struct mmap_region {
     uint64 addr;
-    uint64 len;
+    uint64 len;      // Requested bytes before rounding up to whole pages.
     int prot;
     int flags;
-    uint64 offset;
-    struct file *file;
+    uint64 offset;   // File offset corresponding to addr.
+    struct file *file; // Owned file reference, or 0 for an unused slot.
   } mmap_regions[NMMAP];
-  pagetable_t mmap_pagetable;
+  pagetable_t mmap_pagetable; // Page table that owns the mapped pages.
 };

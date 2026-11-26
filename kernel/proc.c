@@ -167,6 +167,7 @@ freeproc(struct proc *p)
   p->chan = 0;
   p->killed = 0;
   p->xstate = 0;
+  // Reset the alarm before this process slot is reused.
   p->alarm_interval = 0;
   p->alarm_ticks = 0;
   p->alarm_handler = 0;
@@ -214,7 +215,8 @@ void
 proc_freepagetable(pagetable_t pagetable, uint64 sz)
 {
   struct proc *p = myproc();
-  // A successful exec replaces the current page table before freeing it.
+  // A successful exec frees the old page table after installing the new
+  // one. Release the file mappings while their entries can still be read.
   if (p && pagetable == p->mmap_pagetable)
     mmap_clear(p);
   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
@@ -282,6 +284,7 @@ kfork(void)
     return -1;
   }
   np->sz = p->sz;
+  // The ordinary memory copy above ends at p->sz. File mappings live higher.
   if (mmap_fork(p, np) < 0) {
     freeproc(np);
     release(&np->lock);
@@ -290,6 +293,7 @@ kfork(void)
 
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
+  // A child created inside a handler needs the saved context for sigreturn.
   if (p->alarm_active) {
     np->alarm_active = 1;
     np->alarm_trapframe = p->alarm_trapframe;
@@ -347,6 +351,7 @@ kexit(int status)
   if (p == initproc)
     panic("init exiting");
 
+  // Flush shared mappings and release their pages during exit.
   mmap_clear(p);
 
   // Close all open files.

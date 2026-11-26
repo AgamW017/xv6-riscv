@@ -287,6 +287,8 @@ create_inode(char *path, short type, short major, short minor, char *target)
   }
 
   if (target) {
+    // Store the full target before publishing the directory entry. The
+    // inode can be reclaimed if this write fails, for example on a full disk.
     int len = strlen(target) + 1;
     if (writei(ip, 0, (uint64)target, 0, len) != len)
       goto fail;
@@ -328,6 +330,7 @@ sys_symlink(void)
   if (argstr(0, target, MAXPATH) <= 0 || argstr(1, path, MAXPATH) <= 0)
     return -1;
   begin_op();
+  // Store the path now so open can resolve it even if the target appears later.
   struct inode *ip = create_inode(path, T_SYMLINK, 0, 0, target);
   if (ip)
     iunlockput(ip);
@@ -345,8 +348,10 @@ follow_symlink(struct inode *ip, char *path)
 
   for (int depth = 0; ip && ip->type == T_SYMLINK; depth++) {
     uint len = ip->size;
+    // Bound the lookup even for cycles and require a complete target string.
     int valid = depth < 10 && len > 1 && len <= sizeof(target) &&
                 readi(ip, 0, (uint64)target, 0, len) == len && target[len - 1] == 0;
+    // Drop the old link's lock before lookup, which can reach that link again.
     iunlockput(ip);
     struct inode *parent = 0;
     ip = valid && (*target == '/' || dir) ? namei_from(dir, target, &parent) : 0;
@@ -389,6 +394,7 @@ sys_open(void)
     }
     ilock(ip);
   }
+  // O_NOFOLLOW keeps the link inode available for inspecting its target path.
   if (ip->type == T_SYMLINK && !(omode & O_NOFOLLOW) &&
       (ip = follow_symlink(ip, path)) == 0) {
     end_op();
@@ -448,6 +454,8 @@ sys_mmap(void)
   argint(2, &prot);
   argint(3, &flags);
   argaddr(5, &offset);
+  // The caller lets xv6 pick the address and maps from file offset zero.
+  // Faults need a readable file. Shared writes also need write access.
   if (requested != 0 || len == 0 || len >= TRAPFRAME || offset != 0 ||
       prot == 0 || (prot & ~(PROT_READ | PROT_WRITE)) != 0 ||
       (flags != MAP_SHARED && flags != MAP_PRIVATE) ||
@@ -465,6 +473,7 @@ sys_mmap(void)
   if (!slot)
     return -1;
 
+  // Search downward in whole pages, keeping len as the file I/O limit.
   uint64 span = PGROUNDUP(len);
   uint64 top = TRAPFRAME;
   uint64 floor = PGROUNDUP(p->sz);
@@ -477,12 +486,13 @@ sys_mmap(void)
         next = m->addr;
     }
     if (next == top) {
+      // Reserve the range and keep the file open even after close(fd).
       *slot = (struct mmap_region){.addr = addr, .len = len, .prot = prot,
                                   .flags = flags, .file = filedup(f)};
       p->mmap_pagetable = p->pagetable;
       return addr;
     }
-    top = next;
+    top = next; // Try below the mapping that overlapped this range.
   }
   return -1;
 }
@@ -588,6 +598,7 @@ sys_exec(void)
   }
 
   int ret = kexec(path, argv);
+  // A successful exec replaces the program that owned the handler address.
   if (ret >= 0) {
     struct proc *p = myproc();
     p->alarm_interval = 0;

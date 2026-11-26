@@ -70,7 +70,7 @@ usertrap(void)
     // ok
   } else if ((r_scause() == 15 || r_scause() == 13) &&
              mmapfault(p, r_stval(), r_scause() == 15)) {
-    // page fault on a memory-mapped file
+    // The file page is ready. The faulting instruction will retry on return.
   } else if ((r_scause() == 15 || r_scause() == 13) &&
              vmfault(p->pagetable, p->sz, r_stval(),
                      (r_scause() == 13) ? 1 : 0) != 0) {
@@ -86,11 +86,14 @@ usertrap(void)
 
   // give up the CPU if this is a timer interrupt.
   if (which_dev == 2) {
+    // Count ticks from user mode. While a handler runs, keep its saved
+    // context intact until sigreturn restores it.
     if (p->alarm_interval > 0 && !p->alarm_active) {
       p->alarm_ticks++;
       if (p->alarm_ticks >= p->alarm_interval) {
         p->alarm_ticks = 0;
         p->alarm_active = 1;
+        // Save the interrupted context before redirecting to the handler.
         p->alarm_trapframe = *p->trapframe;
         p->trapframe->epc = p->alarm_handler;
       }
